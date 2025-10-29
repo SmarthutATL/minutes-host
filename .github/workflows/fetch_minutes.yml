@@ -2,8 +2,11 @@ name: Update NBA Minutes JSON
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # runs every day at 10:00 UTC (5 AM ET)
-  workflow_dispatch:        # allows you to run it manually
+    - cron: "0 10 * * *"   # daily at 10:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write  # <-- allow the workflow to push to the repo
 
 jobs:
   build:
@@ -12,46 +15,103 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: npm install node-fetch@3
+      # No npm install needed — Node 20 has global fetch.
 
       - name: Generate NBA Minutes JSON
         run: |
           mkdir -p docs/minutes
+          # also ensure GitHub Pages serves /docs without Jekyll transforms
+          touch docs/.nojekyll
+
           node - <<'NODE'
-          import fs from 'fs';
-          import fetch from 'node-fetch';
+          import fs from 'node:fs/promises';
 
-          const YEAR = new Date().getMonth() >= 9 ? new Date().getFullYear() + 1 : new Date().getFullYear();
-          const START = YEAR - 1;
+          // ----- helpers -----
+          const now = new Date();
+          const endYear = (now.getMonth() >= 9) ? now.getFullYear() + 1 : now.getFullYear();
+          const startYear = endYear - 1;
+          const outPath = `docs/minutes/${endYear}.json`;
 
-          console.log(`Fetching minutes for season ${START}-${YEAR.toString().slice(2)}`);
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const chunk = (arr, n) => arr.reduce((a,_,i)=> (i%n? a[a.length-1].push(arr[i]) : a.push([arr[i]]), a), []);
 
-          const outPath = `docs/minutes/${YEAR}.json`;
-          const url = `https://www.balldontlie.io/api/v1/season_averages?season=${START}`;
+          async function fetchAllPlayers() {
+            let page = 1, per = 100, all = [];
+            while (true) {
+              const r = await fetch(`https://www.balldontlie.io/api/v1/players?per_page=${per}&page=${page}&active=true`);
+              const j = await r.json();
+              all.push(...j.data);
+              if (!j.meta?.next_page) break;
+              page++;
+              await sleep(200); // be gentle
+            }
+            return all;
+          }
 
-          fetch(url)
-            .then(res => res.json())
-            .then(data => {
-              fs.writeFileSync(outPath, JSON.stringify(data, null, 2));
-              console.log(`✅ Saved ${outPath}`);
-            })
-            .catch(err => {
-              console.error("❌ Failed to fetch:", err);
-              process.exit(1);
-            });
+          async function fetchSeasonAverages(ids) {
+            const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
+            url.searchParams.set('season', String(startYear));
+            ids.forEach(id => url.searchParams.append('player_ids[]', String(id)));
+            const r = await fetch(url);
+            return (await r.json()).data ?? [];
+          }
+
+          try {
+            console.log(`Building minutes for ${startYear}-${String(endYear).slice(2)}`);
+
+            const players = await fetchAllPlayers();
+            const ids     = players.map(p => p.id);
+            const nameBy  = Object.fromEntries(players.map(p => [p.id, `${p.first_name} ${p.last_name}`]));
+            const teamBy  = Object.fromEntries(players.map(p => [p.id, p.team?.abbreviation ?? '—']));
+
+            let avgs = [];
+            for (const ch of chunk(ids, 100)) {
+              const part = await fetchSeasonAverages(ch);
+              avgs.push(...part);
+              await sleep(300);
+            }
+
+            const rows = avgs.map(a => {
+              const [mm, ss='0'] = a.min.split(':');
+              const mpg = Number(mm) + Number(ss)/60;
+              return {
+                id: a.player_id,
+                playerName: nameBy[a.player_id] ?? String(a.player_id),
+                teamAbbr:   teamBy[a.player_id] ?? '—',
+                games:      a.games_played ?? 0,
+                mpg,
+                rawMin:     a.min
+              };
+            }).sort((a,b)=> b.mpg - a.mpg);
+
+            const envelope = {
+              seasonEndYear: endYear,
+              yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
+              rows
+            };
+
+            await fs.writeFile(outPath, JSON.stringify(envelope, null, 2));
+            console.log(`✅ Saved ${outPath} (${rows.length} rows)`);
+          } catch (e) {
+            console.error('❌ Script failed:', e);
+            process.exit(1);
+          }
           NODE
 
       - name: Commit and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add docs/minutes/*.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/minutes/*.json docs/.nojekyll
           git commit -m "Auto-update NBA minutes JSON" || echo "No changes"
           git push
