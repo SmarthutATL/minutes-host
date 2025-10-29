@@ -6,12 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # <-- allow the workflow to push to the repo
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,87 +22,80 @@ jobs:
         with:
           node-version: "20"
 
-      # No npm install needed — Node 20 has global fetch.
+      - name: Install deps
+        run: |
+          npm install cheerio@1
 
-      - name: Generate NBA Minutes JSON
+      - name: Generate NBA Minutes JSON (from Basketball-Reference)
         run: |
           mkdir -p docs/minutes
-          # also ensure GitHub Pages serves /docs without Jekyll transforms
           touch docs/.nojekyll
-
           node - <<'NODE'
           import fs from 'node:fs/promises';
+          import fetch from 'node-fetch';
+          import * as cheerio from 'cheerio';
 
-          // ----- helpers -----
+          // Season math: NBA pages use END year, e.g. 2026 for 2025–26
           const now = new Date();
           const endYear = (now.getMonth() >= 9) ? now.getFullYear() + 1 : now.getFullYear();
-          const startYear = endYear - 1;
-          const outPath = `docs/minutes/${endYear}.json`;
+          const url = `https://www.basketball-reference.com/leagues/NBA_${endYear}_per_game.html`;
 
-          const sleep = ms => new Promise(r => setTimeout(r, ms));
-          const chunk = (arr, n) => arr.reduce((a,_,i)=> (i%n? a[a.length-1].push(arr[i]) : a.push([arr[i]]), a), []);
-
-          async function fetchAllPlayers() {
-            let page = 1, per = 100, all = [];
-            while (true) {
-              const r = await fetch(`https://www.balldontlie.io/api/v1/players?per_page=${per}&page=${page}&active=true`);
-              const j = await r.json();
-              all.push(...j.data);
-              if (!j.meta?.next_page) break;
-              page++;
-              await sleep(200); // be gentle
-            }
-            return all;
-          }
-
-          async function fetchSeasonAverages(ids) {
-            const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
-            url.searchParams.set('season', String(startYear));
-            ids.forEach(id => url.searchParams.append('player_ids[]', String(id)));
-            const r = await fetch(url);
-            return (await r.json()).data ?? [];
-          }
-
-          try {
-            console.log(`Building minutes for ${startYear}-${String(endYear).slice(2)}`);
-
-            const players = await fetchAllPlayers();
-            const ids     = players.map(p => p.id);
-            const nameBy  = Object.fromEntries(players.map(p => [p.id, `${p.first_name} ${p.last_name}`]));
-            const teamBy  = Object.fromEntries(players.map(p => [p.id, p.team?.abbreviation ?? '—']));
-
-            let avgs = [];
-            for (const ch of chunk(ids, 100)) {
-              const part = await fetchSeasonAverages(ch);
-              avgs.push(...part);
-              await sleep(300);
-            }
-
-            const rows = avgs.map(a => {
-              const [mm, ss='0'] = a.min.split(':');
-              const mpg = Number(mm) + Number(ss)/60;
-              return {
-                id: a.player_id,
-                playerName: nameBy[a.player_id] ?? String(a.player_id),
-                teamAbbr:   teamBy[a.player_id] ?? '—',
-                games:      a.games_played ?? 0,
-                mpg,
-                rawMin:     a.min
-              };
-            }).sort((a,b)=> b.mpg - a.mpg);
-
-            const envelope = {
-              seasonEndYear: endYear,
-              yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
-              rows
-            };
-
-            await fs.writeFile(outPath, JSON.stringify(envelope, null, 2));
-            console.log(`✅ Saved ${outPath} (${rows.length} rows)`);
-          } catch (e) {
-            console.error('❌ Script failed:', e);
+          console.log('Fetching:', url);
+          const res = await fetch(url, { headers: { 'User-Agent': 'minutes-bot' } });
+          if (!res.ok) {
+            const text = await res.text();
+            console.error('HTTP error', res.status, res.statusText);
+            console.error(text.slice(0, 300));
             process.exit(1);
           }
+          const html = await res.text();
+          const $ = cheerio.load(html);
+
+          // Parse table
+          const rows = [];
+          const seen = new Set(); // avoid header duplicates
+
+          $('#per_game_stats tbody tr').each((_, el) => {
+            const $tr = $(el);
+            if ($tr.hasClass('thead')) return; // skip header separators
+
+            const player = $tr.find('td[data-stat="player"]').text().trim();
+            const team   = $tr.find('td[data-stat="team_id"]').text().trim();
+            const gpStr  = $tr.find('td[data-stat="g"]').text().trim();
+            const mpgStr = $tr.find('td[data-stat="mp_per_g"]').text().trim();
+
+            if (!player || !team || !mpgStr) return;
+
+            // BBR has a "TOT" row when traded; keep "TOT" and ignore the team-specific duplicates
+            const key = `${player}|${team}|${mpgStr}|${gpStr}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+
+            const gp  = Number(gpStr) || 0;
+            const mpg = Number(mpgStr) || 0;
+
+            rows.push({
+              // Use array index as id; your app doesn’t rely on global IDs here
+              id: rows.length + 1,
+              playerName: player,
+              teamAbbr: team,
+              games: gp,
+              mpg,
+              rawMin: mpgStr
+            });
+          });
+
+          rows.sort((a,b) => b.mpg - a.mpg);
+
+          const envelope = {
+            seasonEndYear: endYear,
+            yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
+            rows
+          };
+
+          const outPath = `docs/minutes/${endYear}.json`;
+          await fs.writeFile(outPath, JSON.stringify(envelope, null, 2));
+          console.log(`✅ Saved ${outPath} with ${rows.length} players`);
           NODE
 
       - name: Commit and push
