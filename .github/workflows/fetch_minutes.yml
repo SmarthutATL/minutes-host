@@ -1,9 +1,9 @@
-name: Update NBA Minutes JSON (Basketball-Reference)
+name: Update NBA Minutes JSON (Basketball-Reference CSV)
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # daily at 10:00 UTC
-  workflow_dispatch:        # run manually from Actions tab
+    - cron: "0 10 * * *" # daily at 10:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -28,171 +28,71 @@ jobs:
           mkdir -p docs/minutes
           touch docs/.nojekyll
 
-      - name: Install deps
-        run: npm i cheerio@1
-
-      - name: Generate NBA Minutes JSON (balldontlie -> Basketball-Reference fallback)
+      - name: Generate NBA Minutes JSON
         run: |
           node - <<'NODE'
-          import fs from 'node:fs/promises';
-          import cheerio from 'cheerio';
+          import fs from 'fs';
+          import https from 'https';
 
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          const todayKey = ()=>{
-            const d=new Date();
-            return d.toISOString().slice(0,10).replace(/-/g,'');
-          };
-          const seasonEndYear = ()=>{
-            const d=new Date();
-            return (d.getMonth()>=9)? d.getFullYear()+1 : d.getFullYear();
-          };
+          // --- CONFIG ---
+          const year = new Date().getMonth() >= 9 ? new Date().getFullYear() + 1 : new Date().getFullYear();
+          const csvURL = `https://www.basketball-reference.com/leagues/NBA_${year}_per_game.csv`;
+          const outPath = `docs/minutes/${year}.json`;
 
-          async function fetchJSON(url) {
-            const res = await fetch(url, { headers: { 'User-Agent': 'minutes-bot/1.0' }});
-            if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-            return await res.json();
-          }
+          console.log(`🏀 Fetching minutes from ${csvURL}`);
 
-          // ---------- TRY 1: balldontlie (fast path, may be unavailable early in season) ----------
-          async function tryBalldontlie(startYear, endYear) {
-            try {
-              // 1) gather active players (paginated)
-              let page = 1;
-              const names = new Map();
-              const teams = new Map();
-              const ids = [];
-              while (true) {
-                const u = `https://www.balldontlie.io/api/v1/players?per_page=100&page=${page}&active=true`;
-                const r = await fetch(u);
-                if (r.status === 404) throw new Error('players endpoint 404');
-                if (!r.ok) throw new Error(`players page ${page} -> ${r.status}`);
-                const j = await r.json();
-                (j.data ?? []).forEach(p=>{
-                  ids.push(p.id);
-                  names.set(p.id, `${p.first_name} ${p.last_name}`);
-                  teams.set(p.id, p.team?.abbreviation ?? '—');
-                });
-                if (!j.meta?.next_page) break;
-                page++;
-                await sleep(150);
-              }
-
-              // 2) season averages in chunks of 100
-              const chunk = (arr,n)=>arr.reduce((a,x,i)=>(i%n?a[a.length-1].push(x):a.push([x]),a),[]);
-              const rows = [];
-              let tmpId = 1;
-
-              for (const ch of chunk(ids, 100)) {
-                const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
-                url.searchParams.set('season', String(startYear));
-                ch.forEach(id=>url.searchParams.append('player_ids[]', String(id)));
-                const j = await fetchJSON(url.toString());
-                for (const a of (j.data ?? [])) {
-                  const min = a.min ?? '0:00';
-                  const [mm, ss='0'] = min.split(':');
-                  const mpg = Number(mm) + Number(ss)/60;
-                  if (mpg<=0) continue;
-                  rows.push({
-                    id: tmpId++,
-                    playerName: names.get(a.player_id) ?? String(a.player_id),
-                    teamAbbr: teams.get(a.player_id) ?? '—',
-                    games: a.games_played ?? 0,
-                    mpg,
-                    rawMin: min
-                  });
+          function fetchCSV(url) {
+            return new Promise((resolve, reject) => {
+              https.get(url, res => {
+                if (res.statusCode !== 200) {
+                  reject(new Error(`HTTP ${res.statusCode}`));
+                  return;
                 }
-                await sleep(150);
-              }
-
-              rows.sort((a,b)=>b.mpg-a.mpg);
-              if (!rows.length) return null;
-
-              return {
-                seasonEndYear: endYear,
-                yyyymmdd: todayKey(),
-                rows
-              };
-            } catch (e) {
-              console.warn('balldontlie failed:', e.message);
-              return null;
-            }
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(data));
+              }).on('error', reject);
+            });
           }
 
-          // ---------- TRY 2: Basketball-Reference (HTML parse, very reliable) ----------
-          async function fromBBRef(endYear) {
-            const url = `https://www.basketball-reference.com/leagues/NBA_${endYear}_per_game.html`;
-            const res = await fetch(url, { headers: { 'User-Agent': 'minutes-bot/1.0' }});
-            if (!res.ok) throw new Error(`BBRef ${endYear} -> ${res.status}`);
-            const html = await res.text();
-
-            const $ = cheerio.load(html);
-            const seen = new Map(); // key: player name, value: row; prefer TOT
-            $('#per_game_stats tbody tr').each((_, el) => {
-              const row = $(el);
-              if (row.hasClass('thead')) return;
-
-              const name = row.find('[data-stat="player"]').text().trim();
-              const team = (row.find('[data-stat="team_id"]').text().trim() || '—');
-              const gStr = row.find('[data-stat="g"]').text().trim() || '0';
-              const mpStr = row.find('[data-stat="mp_per_g"]').text().trim() || '0';
-              const gp = parseInt(gStr, 10);
-              const mpg = parseFloat(mpStr);
-
-              if (!name || !Number.isFinite(mpg) || mpg<=0) return;
-
-              const cand = {
-                id: 0, playerName: name, teamAbbr: team,
-                games: Number.isFinite(gp)? gp : 0,
-                mpg, rawMin: mpg.toFixed(1)
-              };
-
-              const existed = seen.get(name);
-              if (!existed) seen.set(name, cand);
-              else if (team === 'TOT') seen.set(name, cand); // prefer TOT
+          function parseCSV(csv) {
+            const lines = csv.trim().split('\n');
+            const headers = lines[0].split(',');
+            const rows = lines.slice(1).map(line => {
+              const values = line.split(',');
+              const obj = {};
+              headers.forEach((h, i) => obj[h] = values[i]);
+              return obj;
             });
 
-            const rows = Array.from(seen.values())
-              .map((r, idx) => ({ ...r, id: idx+1 }))
-              .sort((a,b)=>b.mpg-a.mpg);
-
-            if (!rows.length) throw new Error('BBRef parse produced 0 rows');
-
-            return {
-              seasonEndYear: endYear,
-              yyyymmdd: todayKey(),
-              rows
-            };
+            // Extract key stats
+            return rows
+              .filter(r => !isNaN(parseFloat(r.MP))) // skip headers/invalid rows
+              .map((r, i) => ({
+                id: i + 1,
+                playerName: r.Player,
+                teamAbbr: r.Tm,
+                games: parseInt(r.G, 10) || 0,
+                mpg: parseFloat(r.MP) || 0,
+                rawMin: r.MP
+              }))
+              .sort((a, b) => b.mpg - a.mpg);
           }
 
-          // ---------------- MAIN ----------------
-          const endYear = seasonEndYear();
-          const startYear = endYear - 1;
-          const outPath = `docs/minutes/${endYear}.json`;
-
-          console.log(`🎯 Target season: ${startYear}-${String(endYear).slice(2)}`);
-
-          // wrap everything in an async IIFE so we can safely use await (no top-level return!)
-          (async () => {
-            // 1) Try balldontlie for current season
-            let env = await tryBalldontlie(startYear, endYear);
-
-            // 2) If no luck, try BBRef for endYear, then fallback to previous endYear-1
-            if (!env) {
-              try {
-                env = await fromBBRef(endYear);
-              } catch (e1) {
-                console.warn('BBRef current season failed, trying previous:', e1.message);
-                env = await fromBBRef(endYear - 1);
-              }
-            }
-
-            // write the envelope
-            await fs.writeFile(outPath, JSON.stringify(env, null, 2));
-            console.log(`✅ Saved ${outPath} (${env.rows.length} players)`);
-          })().catch(err => {
-            console.error('❌ Script failed:', err);
+          try {
+            const csv = await fetchCSV(csvURL);
+            const rows = parseCSV(csv);
+            const env = {
+              seasonEndYear: year,
+              yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
+              rows
+            };
+            fs.writeFileSync(outPath, JSON.stringify(env, null, 2));
+            console.log(`✅ Saved ${outPath} (${rows.length} rows)`);
+          } catch (err) {
+            console.error('❌ Failed:', err.message);
             process.exit(1);
-          });
+          }
           NODE
 
       - name: Commit and push
