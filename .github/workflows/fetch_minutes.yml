@@ -1,12 +1,12 @@
-name: Update NBA Minutes JSON
+name: Update NBA Minutes JSON (balldontlie, with fallback)
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # daily at 10:00 UTC (5–6am ET depending on DST)
+    - cron: "0 10 * * *"   # daily at 10:00 UTC
   workflow_dispatch:
 
 permissions:
-  contents: write  # allow the workflow to push to the repo
+  contents: write
 
 jobs:
   build:
@@ -23,92 +23,81 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Generate NBA Minutes JSON (balldontlie, with fallback)
+      - name: Generate NBA Minutes JSON
         run: |
           mkdir -p docs/minutes
-          # Make sure Pages serves /docs as static files (no Jekyll processing)
           touch docs/.nojekyll
 
           node - <<'NODE'
-          // No imports needed; Node 20+ has global fetch.
-          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-          const chunk = (arr, n) => {
-            const out = [];
-            for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-            return out;
-          };
+          import fs from 'node:fs/promises';
 
-          // Build one season and return rows in your PlayerMinutes shape
-          async function buildSeasonRows(startYear) {
-            console.log(`📥 Fetching active players list…`);
-            let page = 1, per = 100, players = [];
+          async function fetchJSON(url) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
+            return await res.json();
+          }
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const chunk = (arr, n) => arr.reduce((a,_,i)=>(i%n?a[a.length-1].push(arr[i]):a.push([arr[i]]),a),[]);
+
+          async function fetchPlayers(year) {
+            let page = 1, all = [];
             while (true) {
-              const url = `https://www.balldontlie.io/api/v1/players?per_page=${per}&page=${page}&active=true`;
-              const res = await fetch(url);
-              if (!res.ok) throw new Error(`players page ${page} -> ${res.status}`);
+              const u = `https://www.balldontlie.io/api/v1/players?per_page=100&page=${page}&active=true`;
+              const res = await fetch(u);
+              if (res.status === 404) throw new Error(`players page ${page} -> 404`);
               const j = await res.json();
-              if (!Array.isArray(j.data)) throw new Error(`players page ${page} invalid payload`);
-              players.push(...j.data);
+              all.push(...j.data);
               if (!j.meta?.next_page) break;
               page++;
-              await sleep(150);
+              await sleep(200);
             }
-            console.log(`🧾 Active players: ${players.length}`);
+            return all;
+          }
 
-            const idToName = new Map(players.map(p => [p.id, `${p.first_name} ${p.last_name}`]));
-            const idToTeam = new Map(players.map(p => [p.id, p.team?.abbreviation ?? '—']));
+          async function buildSeasonRows(startYear) {
+            const players = await fetchPlayers(startYear);
             const ids = players.map(p => p.id);
-            const batches = chunk(ids, 100);
+            const nameBy = Object.fromEntries(players.map(p => [p.id, `${p.first_name} ${p.last_name}`]));
+            const teamBy = Object.fromEntries(players.map(p => [p.id, p.team?.abbreviation ?? '—']));
 
-            console.log(`📊 Fetching season averages for ${startYear} in ${batches.length} batches…`);
-            const avgs = [];
-            for (const [i, batch] of batches.entries()) {
-              const u = new URL('https://www.balldontlie.io/api/v1/season_averages');
-              u.searchParams.set('season', String(startYear));
-              for (const id of batch) u.searchParams.append('player_ids[]', String(id));
-
-              const res = await fetch(u);
-              if (!res.ok) {
-                // 404/400 usually means season not available yet
-                throw new Error(`season_averages ${startYear} batch ${i+1}/${batches.length} -> ${res.status}`);
-              }
-              const j = await res.json();
-              const data = Array.isArray(j.data) ? j.data : [];
-              avgs.push(...data);
+            let avgs = [];
+            for (const ch of chunk(ids, 100)) {
+              const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
+              url.searchParams.set('season', String(startYear));
+              ch.forEach(id => url.searchParams.append('player_ids[]', String(id)));
+              const j = await fetchJSON(url);
+              avgs.push(...(j.data ?? []));
               await sleep(200);
             }
 
-            console.log(`✅ Got ${avgs.length} season-avg records for ${startYear}`);
-            // Map to your PlayerMinutes rows
-            let nextID = 1;
-            const rows = avgs.map(a => {
-              const [mm, ss = '0'] = String(a.min ?? '0').split(':');
-              const mpg = Number(mm || 0) + Number(ss || 0)/60;
+            return avgs.map(a => {
+              const [mm, ss='0'] = a.min.split(':');
+              const mpg = Number(mm) + Number(ss)/60;
               return {
-                id: nextID++,
-                playerName: idToName.get(a.player_id) ?? String(a.player_id),
-                teamAbbr:   idToTeam.get(a.player_id) ?? '—',
-                games:      Number(a.games_played ?? 0),
+                id: a.player_id,
+                playerName: nameBy[a.player_id] ?? String(a.player_id),
+                teamAbbr: teamBy[a.player_id] ?? '—',
+                games: a.games_played ?? 0,
                 mpg,
-                rawMin:     String(a.min ?? '0:00')
+                rawMin: a.min
               };
-            }).filter(r => r.mpg > 0).sort((a,b) => b.mpg - a.mpg);
-
-            return rows;
+            }).sort((a,b)=>b.mpg-a.mpg);
           }
 
-          (async () => {
-            const now = new Date();
-            const endYear = (now.getMonth() >= 9) ? now.getFullYear() + 1 : now.getFullYear(); // Oct–Dec => next year
-            const startYear = endYear - 1;
-            const outPath = `docs/minutes/${endYear}.json`;
+          // MAIN
+          const now = new Date();
+          const endYear = (now.getMonth()>=9) ? now.getFullYear()+1 : now.getFullYear();
+          const startYear = endYear - 1;
+          const outPath = `docs/minutes/${endYear}.json`;
 
-            console.log(`🔎 Target season: ${startYear}-${String(endYear).slice(2)}`);
+          console.log(`🏀 Target season: ${startYear}-${String(endYear).slice(2)}`);
 
-            let rows = [];
+          try {
+            console.log('📡 Fetching active players list…');
+            let rows;
             try {
               rows = await buildSeasonRows(startYear);
-              if (rows.length === 0) throw new Error('no rows for current season');
             } catch (e) {
               console.warn(`⚠️ Current season unavailable (${e.message}). Trying previous season…`);
               rows = await buildSeasonRows(startYear - 1);
@@ -119,14 +108,12 @@ jobs:
               yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
               rows
             };
-
-            const fs = await import('node:fs/promises');
             await fs.writeFile(outPath, JSON.stringify(envelope, null, 2));
-            console.log(`💾 Saved ${outPath} with ${rows.length} rows`);
-          })().catch(err => {
+            console.log(`✅ Saved ${outPath} (${rows.length} players)`);
+          } catch (err) {
             console.error('❌ Script failed:', err);
             process.exit(1);
-          });
+          }
           NODE
 
       - name: Commit and push
