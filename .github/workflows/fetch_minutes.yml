@@ -1,8 +1,8 @@
-name: Update NBA Minutes JSON (Basketball-Reference CSV)
+name: Update NBA Minutes JSON (NBA Stats → GitHub Pages)
 
 on:
   schedule:
-    - cron: "0 10 * * *" # daily at 10:00 UTC
+    - cron: "0 10 * * *"     # daily at 10:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,76 +27,172 @@ jobs:
           mkdir -p docs/minutes
           touch docs/.nojekyll
 
-      - name: Generate NBA Minutes JSON
+      - name: Generate minutes JSON from NBA Stats
         run: |
           node - <<'NODE'
-          import fs from 'fs';
-          import https from 'https';
+          import fs from 'node:fs/promises';
 
-          // --- CONFIG ---
-          const year = new Date().getMonth() >= 9 ? new Date().getFullYear() + 1 : new Date().getFullYear();
-          const csvURL = `https://www.basketball-reference.com/leagues/NBA_${year}_per_game.csv`;
-          const outPath = `docs/minutes/${year}.json`;
+          // ---------- season helpers ----------
+          const now = new Date();
+          const endYear = (now.getMonth() >= 9) ? now.getFullYear() + 1 : now.getFullYear();   // e.g. 2026
+          const startYear = endYear - 1;                                                        // e.g. 2025
+          const seasonStr = `${startYear}-${String(endYear).slice(-2)}`;                        // e.g. "2025-26"
+          const OUT = `docs/minutes/${endYear}.json`;
 
-          console.log(`🏀 Fetching minutes from ${csvURL}`);
+          // ---------- HTTP helpers ----------
+          const commonHeaders = {
+            // NBA stats expects "real browser" headers; these work reliably in Actions
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Origin": "https://www.nba.com",
+            "Referer": "https://www.nba.com/stats/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent":
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "x-nba-stats-origin": "stats",
+            "x-nba-stats-token": "true",
+            // compression is automatic in fetch; no need to request gzip explicitly
+          };
 
-          function fetchCSV(url) {
-            return new Promise((resolve, reject) => {
-              https.get(url, res => {
-                if (res.statusCode !== 200) {
-                  reject(new Error(`HTTP ${res.statusCode}`));
-                  return;
-                }
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => resolve(data));
-              }).on('error', reject);
-            });
+          async function getJSON(url) {
+            const res = await fetch(url, { headers: commonHeaders });
+            if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+            return await res.json();
           }
 
-          function parseCSV(csv) {
-            const lines = csv.trim().split('\n');
-            const headers = lines[0].split(',');
-            const rows = lines.slice(1).map(line => {
-              const values = line.split(',');
-              const obj = {};
-              headers.forEach((h, i) => obj[h] = values[i]);
-              return obj;
-            });
+          // ---------- providers ----------
+          // Preferred: leagueleaders (StatCategory=MIN, PerGame)
+          async function fetchFromLeagueLeaders() {
+            const url = new URL("https://stats.nba.com/stats/leagueleaders");
+            url.search = new URLSearchParams({
+              LeagueID: "00",
+              PerMode: "PerGame",
+              Scope: "RS",
+              Season: seasonStr,
+              SeasonType: "Regular Season",
+              StatCategory: "MIN",
+              ActiveFlag: "Y"
+            }).toString();
 
-            // Extract key stats
-            return rows
-              .filter(r => !isNaN(parseFloat(r.MP))) // skip headers/invalid rows
-              .map((r, i) => ({
-                id: i + 1,
-                playerName: r.Player,
-                teamAbbr: r.Tm,
-                games: parseInt(r.G, 10) || 0,
-                mpg: parseFloat(r.MP) || 0,
-                rawMin: r.MP
-              }))
-              .sort((a, b) => b.mpg - a.mpg);
+            const j = await getJSON(url.toString());
+            const rs = j.resultSet ?? j.resultSets?.[0];
+            if (!rs) return [];
+
+            const headers = rs.headers;
+            const rows = rs.rowSet || [];
+
+            const idx = (k) => headers.indexOf(k);
+            const iName = (idx("PLAYER") !== -1 ? idx("PLAYER") : idx("PLAYER_NAME"));
+            const iTeam = (idx("TEAM") !== -1 ? idx("TEAM") : idx("TEAM_ABBREVIATION"));
+            const iGP   = idx("GP");
+            const iMIN  = idx("MIN");
+            if (iName < 0 || iTeam < 0 || iGP < 0 || iMIN < 0) return [];
+
+            let out = [];
+            let id = 1;
+            for (const r of rows) {
+              const name = r[iName] ?? "";
+              if (!name) continue;
+              const team = r[iTeam] ?? "—";
+              const gp   = Number(r[iGP] ?? 0) || 0;
+              const mpg  = Number(r[iMIN] ?? 0) || 0;
+              out.push({
+                id: id++,
+                playerName: String(name),
+                teamAbbr: String(team),
+                games: gp,
+                mpg,
+                rawMin: mpg.toFixed(1)
+              });
+            }
+            out.sort((a,b)=>b.mpg - a.mpg);
+            return out;
           }
 
+          // Fallback: leaguedashplayerstats (MeasureType=Base, PerGame)
+          async function fetchFromLeagueDash() {
+            const url = new URL("https://stats.nba.com/stats/leaguedashplayerstats");
+            url.search = new URLSearchParams({
+              LeagueID: "00",
+              MeasureType: "Base",
+              PerMode: "PerGame",
+              PlusMinus: "N",
+              PaceAdjust: "N",
+              Rank: "N",
+              Season: seasonStr,
+              SeasonType: "Regular Season"
+            }).toString();
+
+            const j = await getJSON(url.toString());
+            const rs = j.resultSets?.[0] ?? j.resultSet;
+            if (!rs) return [];
+
+            const headers = rs.headers;
+            const rows = rs.rowSet || [];
+
+            const idx = (k) => headers.indexOf(k);
+            const iName = (idx("PLAYER_NAME") !== -1 ? idx("PLAYER_NAME") : idx("PLAYER"));
+            const iTeam = (idx("TEAM_ABBREVIATION") !== -1 ? idx("TEAM_ABBREVIATION") : idx("TEAM"));
+            const iGP   = idx("GP");
+            const iMIN  = idx("MIN");
+            if (iName < 0 || iTeam < 0 || iGP < 0 || iMIN < 0) return [];
+
+            let out = [];
+            let id = 1;
+            for (const r of rows) {
+              const name = r[iName] ?? "";
+              if (!name) continue;
+              const team = r[iTeam] ?? "—";
+              const gp   = Number(r[iGP] ?? 0) || 0;
+              const mpg  = Number(r[iMIN] ?? 0) || 0;
+              out.push({
+                id: id++,
+                playerName: String(name),
+                teamAbbr: String(team),
+                games: gp,
+                mpg,
+                rawMin: mpg.toFixed(1)
+              });
+            }
+            out.sort((a,b)=>b.mpg - a.mpg);
+            return out;
+          }
+
+          // ---------- main ----------
+          console.log(`🏀 Season: ${seasonStr}`);
+          let rows = [];
           try {
-            const csv = await fetchCSV(csvURL);
-            const rows = parseCSV(csv);
-            const env = {
-              seasonEndYear: year,
-              yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
-              rows
-            };
-            fs.writeFileSync(outPath, JSON.stringify(env, null, 2));
-            console.log(`✅ Saved ${outPath} (${rows.length} rows)`);
-          } catch (err) {
-            console.error('❌ Failed:', err.message);
-            process.exit(1);
+            console.log("📈 Fetching from leagueleaders…");
+            rows = await fetchFromLeagueLeaders();
+          } catch (e) {
+            console.warn("leagueleaders failed:", e.message);
           }
+          if (!rows.length) {
+            try {
+              console.log("↩️ Falling back to leaguedashplayerstats…");
+              rows = await fetchFromLeagueDash();
+            } catch (e) {
+              console.warn("leaguedash failed:", e.message);
+            }
+          }
+          if (!rows.length) {
+            throw new Error("Both NBA providers returned 0 rows.");
+          }
+
+          const envelope = {
+            seasonEndYear: endYear,
+            yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
+            rows
+          };
+          await fs.writeFile(OUT, JSON.stringify(envelope, null, 2));
+          console.log(`✅ Wrote ${OUT} (${rows.length} players)`);
           NODE
 
       - name: Commit and push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
