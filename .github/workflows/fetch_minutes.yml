@@ -1,0 +1,57 @@
+name: Update NBA Minutes JSON
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # runs every day at 10:00 UTC (5 AM ET)
+  workflow_dispatch:        # allows you to run it manually
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install node-fetch@3
+
+      - name: Generate NBA Minutes JSON
+        run: |
+          mkdir -p docs/minutes
+          node - <<'NODE'
+          import fs from 'fs';
+          import fetch from 'node-fetch';
+
+          const YEAR = new Date().getMonth() >= 9 ? new Date().getFullYear() + 1 : new Date().getFullYear();
+          const START = YEAR - 1;
+
+          console.log(`Fetching minutes for season ${START}-${YEAR.toString().slice(2)}`);
+
+          const outPath = `docs/minutes/${YEAR}.json`;
+          const url = `https://www.balldontlie.io/api/v1/season_averages?season=${START}`;
+
+          fetch(url)
+            .then(res => res.json())
+            .then(data => {
+              fs.writeFileSync(outPath, JSON.stringify(data, null, 2));
+              console.log(`✅ Saved ${outPath}`);
+            })
+            .catch(err => {
+              console.error("❌ Failed to fetch:", err);
+              process.exit(1);
+            });
+          NODE
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add docs/minutes/*.json
+          git commit -m "Auto-update NBA minutes JSON" || echo "No changes"
+          git push
