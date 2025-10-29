@@ -1,4 +1,4 @@
-name: Update NBA Minutes JSON (balldontlie, with fallback)
+name: Update NBA Minutes JSON
 
 on:
   schedule:
@@ -23,93 +23,168 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Generate NBA Minutes JSON
+      - name: Prepare output folder
         run: |
           mkdir -p docs/minutes
           touch docs/.nojekyll
 
+      - name: Generate NBA Minutes JSON (balldontlie → Basketball-Reference fallback)
+        run: |
           node - <<'NODE'
           import fs from 'node:fs/promises';
-
-          async function fetchJSON(url) {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
-            return await res.json();
-          }
 
           const sleep = ms => new Promise(r => setTimeout(r, ms));
           const chunk = (arr, n) => arr.reduce((a,_,i)=>(i%n?a[a.length-1].push(arr[i]):a.push([arr[i]]),a),[]);
 
-          async function fetchPlayers(year) {
-            let page = 1, all = [];
-            while (true) {
-              const u = `https://www.balldontlie.io/api/v1/players?per_page=100&page=${page}&active=true`;
-              const res = await fetch(u);
-              if (res.status === 404) throw new Error(`players page ${page} -> 404`);
-              const j = await res.json();
-              all.push(...j.data);
-              if (!j.meta?.next_page) break;
-              page++;
-              await sleep(200);
+          // ---- balldontlie path ----
+          async function tryBalldontlie(startYear, endYear) {
+            console.log('📡 Trying balldontlie…');
+            async function fetchPlayers() {
+              let page = 1, all = [];
+              while (true) {
+                const u = `https://www.balldontlie.io/api/v1/players?per_page=100&page=${page}&active=true`;
+                const res = await fetch(u);
+                if (!res.ok) throw new Error(`players page ${page} -> ${res.status}`);
+                const j = await res.json();
+                all.push(...j.data);
+                if (!j.meta?.next_page) break;
+                page++;
+                await sleep(150);
+              }
+              return all;
             }
-            return all;
-          }
+            async function fetchSeasonAverages(ids) {
+              const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
+              url.searchParams.set('season', String(startYear));
+              ids.forEach(id => url.searchParams.append('player_ids[]', String(id)));
+              const res = await fetch(url);
+              if (!res.ok) throw new Error(`season_averages -> ${res.status}`);
+              return (await res.json()).data ?? [];
+            }
 
-          async function buildSeasonRows(startYear) {
-            const players = await fetchPlayers(startYear);
+            const players = await fetchPlayers();
             const ids = players.map(p => p.id);
             const nameBy = Object.fromEntries(players.map(p => [p.id, `${p.first_name} ${p.last_name}`]));
             const teamBy = Object.fromEntries(players.map(p => [p.id, p.team?.abbreviation ?? '—']));
 
             let avgs = [];
             for (const ch of chunk(ids, 100)) {
-              const url = new URL('https://www.balldontlie.io/api/v1/season_averages');
-              url.searchParams.set('season', String(startYear));
-              ch.forEach(id => url.searchParams.append('player_ids[]', String(id)));
-              const j = await fetchJSON(url);
-              avgs.push(...(j.data ?? []));
-              await sleep(200);
+              const part = await fetchSeasonAverages(ch);
+              avgs.push(...part);
+              await sleep(150);
             }
 
-            return avgs.map(a => {
-              const [mm, ss='0'] = a.min.split(':');
+            const rows = avgs.map(a => {
+              const [mm, ss='0'] = (a.min ?? '0:00').split(':');
               const mpg = Number(mm) + Number(ss)/60;
               return {
                 id: a.player_id,
                 playerName: nameBy[a.player_id] ?? String(a.player_id),
-                teamAbbr: teamBy[a.player_id] ?? '—',
-                games: a.games_played ?? 0,
+                teamAbbr:   teamBy[a.player_id] ?? '—',
+                games:      a.games_played ?? 0,
                 mpg,
-                rawMin: a.min
+                rawMin:     a.min ?? '0:00'
               };
-            }).sort((a,b)=>b.mpg-a.mpg);
+            }).sort((a,b)=> b.mpg - a.mpg);
+
+            return {seasonEndYear: endYear, rows};
           }
 
-          // MAIN
-          const now = new Date();
-          const endYear = (now.getMonth()>=9) ? now.getFullYear()+1 : now.getFullYear();
-          const startYear = endYear - 1;
-          const outPath = `docs/minutes/${endYear}.json`;
+          // ---- Basketball-Reference path (HTML scrape) ----
+          // Uses the per-game table: https://www.basketball-reference.com/leagues/NBA_<ENDYEAR>_per_game.html
+          async function tryBasketballReference(endYear) {
+            console.log('🕸️ Falling back to Basketball-Reference…');
+            const url = `https://www.basketball-reference.com/leagues/NBA_${endYear}_per_game.html`;
+            const res = await fetch(url, { headers: { 'User-Agent': 'minutes-bot/1.0' }});
+            if (!res.ok) throw new Error(`bball-ref ${endYear} -> ${res.status}`);
+            const html = await res.text();
 
-          console.log(`🏀 Target season: ${startYear}-${String(endYear).slice(2)}`);
+            // Minimal HTML parsing without extra deps:
+            // Grab rows from the per_game_stats table body.
+            const tbody = html.split('id="per_game_stats"')[1]?.split('</table>')[0] ?? '';
+            const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
 
-          try {
-            console.log('📡 Fetching active players list…');
-            let rows;
-            try {
-              rows = await buildSeasonRows(startYear);
-            } catch (e) {
-              console.warn(`⚠️ Current season unavailable (${e.message}). Trying previous season…`);
-              rows = await buildSeasonRows(startYear - 1);
+            // Prefer 'TOT' row for players who changed teams.
+            const byPlayer = new Map();
+
+            let m;
+            while ((m = rowRegex.exec(tbody)) !== null) {
+              const row = m[1];
+              if (row.includes('class="thead"')) continue; // skip header separators
+
+              const getCell = stat => {
+                const re = new RegExp(`data-stat="${stat}"[^>]*>(?:<[^>]+>)*([^<]*)`, 'i');
+                const mm = re.exec(row);
+                return mm ? mm[1].trim() : '';
+              };
+
+              const name = getCell('player');
+              const team = getCell('team_id') || '—';
+              const gp   = parseInt(getCell('g') || '0', 10);
+              const mp   = parseFloat(getCell('mp_per_g') || '0');
+
+              if (!name || mp <= 0) continue;
+
+              const prev = byPlayer.get(name);
+              if (!prev) {
+                byPlayer.set(name, { name, team, gp, mp });
+              } else {
+                // If we later see TOT, replace; otherwise keep the first.
+                if (team === 'TOT') byPlayer.set(name, { name, team, gp, mp });
+              }
             }
 
+            // Build rows
+            let id = 1;
+            const rows = Array.from(byPlayer.values()).map(p => ({
+              id: id++,
+              playerName: p.name,
+              teamAbbr: p.team,
+              games: p.gp,
+              mpg: p.mp,
+              rawMin: p.mp.toFixed(1)
+            })).sort((a,b)=> b.mpg - a.mpg);
+
+            return {seasonEndYear: endYear, rows};
+          }
+
+          // ---- Main runner ----
+          const now = new Date();
+          const endYearGuess = (now.getMonth() >= 9) ? now.getFullYear() + 1 : now.getFullYear();
+          const startYearGuess = endYearGuess - 1;
+          const outPath = `docs/minutes/${endYearGuess}.json`;
+
+          console.log(`🎯 Target season: ${startYearGuess}-${String(endYearGuess).slice(2)}`);
+
+          async function writeEnvelope(env) {
             const envelope = {
-              seasonEndYear: endYear,
+              seasonEndYear: env.seasonEndYear,
               yyyymmdd: new Date().toISOString().slice(0,10).replace(/-/g,''),
-              rows
+              rows: env.rows
             };
             await fs.writeFile(outPath, JSON.stringify(envelope, null, 2));
-            console.log(`✅ Saved ${outPath} (${rows.length} players)`);
+            console.log(`✅ Saved ${outPath} (${env.rows.length} rows)`);
+          }
+
+          try {
+            // 1) balldontlie for the guessed season
+            try {
+              const env = await tryBalldontlie(startYearGuess, endYearGuess);
+              if (env.rows.length > 0) return await writeEnvelope(env);
+              console.warn('balldontlie returned 0 rows, will fall back…');
+            } catch (e) {
+              console.warn(`balldontlie error: ${e.message}`);
+            }
+
+            // 2) Basketball-Reference for the same endYear; if missing (new season), try endYear-1
+            try {
+              const env = await tryBasketballReference(endYearGuess);
+              if (env.rows.length > 0) return await writeEnvelope(env);
+            } catch (e1) {
+              console.warn(`bball-ref ${endYearGuess} failed: ${e1.message}`);
+              const envPrev = await tryBasketballReference(endYearGuess - 1);
+              await writeEnvelope(envPrev);
+            }
           } catch (err) {
             console.error('❌ Script failed:', err);
             process.exit(1);
